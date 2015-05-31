@@ -12,6 +12,7 @@ import numpy as np
 from skimage import img_as_ubyte
 import toolz as tz
 from sklearn import neighbors
+from sklearn.manifold import TSNE
 
 # local imports
 from . import io
@@ -19,7 +20,7 @@ from . import screens
 from .screens import cellomics
 from . import preprocess as pre
 from . import cluster
-from .io import temporary_hdf5_dataset
+from .io import feature_container
 from six.moves import map, zip
 
 
@@ -242,6 +243,8 @@ features.add_argument('--random-seed', type=int, default=None,
                       help='Set random seed, for testing and debugging only.')
 features.add_argument('-e', '--emitter', default='json',
                       help='Format to output features during computation.')
+features.add_argument('-t', '--tsne-num-pca-components', type=int, default=50,
+                      help='Number of PCA components to feed into tSNE.')
 features.add_argument('-G', '--global-threshold', action='store_true',
                       help='Use sampled intensity from all images to obtain '
                            'a global threshold.')
@@ -268,11 +271,14 @@ def run_features(args):
     f0, feature_names = fmap(next(images))
     feature_vectors = tz.cons(f0, (fmap(im)[0] for im in images))
     online_scaler = cluster.OnlineStandardScaler()
-    online_pca = cluster.OnlineIncrementalPCA(n_components=args.n_components,
-                                              batch_size=args.pca_batch_size)
     nimages, nfeatures = len(args.images), len(f0)
+    ncomps = min(nimages,
+                 max(args.n_components, args.tsne_num_pca_components))
+    online_pca = cluster.OnlineIncrementalPCA(n_components=ncomps,
+                                              batch_size=args.pca_batch_size)
     emit = io.emitter_function(args.emitter)
-    with temporary_hdf5_dataset((nimages, nfeatures), 'float') as dset:
+    with feature_container((nimages, nfeatures)) as dset,\
+            feature_container((nimages, ncomps)) as rdset:
         # First pass: compute the features, compute the mean and SD,
         # compute the PCA
         for i, (idx, v) in enumerate(zip(indices, feature_vectors)):
@@ -286,8 +292,9 @@ def run_features(args):
             v_std = scaler.transform(v)
             v_pca = online_pca.transform(v)
             dset[i] = v_std
+            rdset[i] = v_pca
             emit({'_id': idx, 'feature_vector_std': list(v_std),
-                              'pca_vector': list(v_pca)})
+                              'pca_vector': list(v_pca[:args.n_components])})
             online_pca.transform(v)
         # Third pass: Compute the nearest neighbors graph.
         # THIS ANNOYINGLY INSTANTIATES FULL ARRAY -- no out-of-core
@@ -296,6 +303,12 @@ def run_features(args):
                                         include_self=False, mode='distance')
         for idx, row in zip(indices, ng):
             emit({'_id': idx, 'neighbours': [indices[i] for i in row.indices]})
+        # Fourth pass: Compute the tSNE decomposition.
+        # Again, full array instantiated; in fact, full nsamples x nsamples
+        # distance matrix instantiated!
+        tsne = TSNE(args.n_components).fit_transform(rdset)
+        for idx, v in zip(indices, tsne):
+            emit({'_id': idx, 'tsne_vector': list(v)})
 
 
 if __name__ == '__main__':
